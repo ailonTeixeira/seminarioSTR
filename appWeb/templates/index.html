@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monitoramento de Pressão</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        .alert-blink {
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0% { background-color: transparent; }
+            50% { background-color: red; }
+            100% { background-color: transparent; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-5">
+        <h1 class="text-center">Monitoramento de Pressão</h1>
+        <div class="row mt-4">
+            <div class="col-md-12 text-center" id="pressure-container">
+                <i class="fas fa-tachometer-alt fa-3x text-primary"></i>
+                <h2>Pressão</h2>
+                <p id="pressure" class="display-4">{{ pressure }} bar</p>
+            </div>
+        </div>
+        <div class="row mt-4">
+            <div class="col-md-12">
+                <canvas id="pressureChart"></canvas>
+            </div>
+        </div>
+        <div class="row mt-4">
+            <div class="col-md-12 text-center">
+                <a href="/dados" class="btn btn-primary">Ver Dados Armazenados</a>
+            </div>
+        </div>
+    </div>
+    <script>
+        const ctx = document.getElementById('pressureChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [], // Tempo
+                datasets: [{
+                    label: 'Pressão (bar)',
+                    data: [],
+                    borderColor: 'rgba(54, 162, 235, 1)',
+                    fill: false
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    x: {
+                        display: true,
+                        title: {
+                            display: true,
+                            text: 'Tempo'
+                        }
+                    },
+                    y: {
+                        beginAtZero: true, // Começa o eixo Y do 0
+                        display: true,
+                        title: {
+                            display: true,
+                            text: 'Pressão (bar)'
+                        }
+                    }
+                }
+            }
+        });
+
+        // Função para carregar os últimos 20 dados ao abrir a página
+        function loadLatestData() {
+            fetch('/latest-data')
+                .then(response => response.json())
+                .then(data => {
+                    // Inverte a ordem dos dados para exibir do mais antigo para o mais recente
+                    data.reverse();
+
+                    // Preenche o gráfico com os dados recuperados
+                    data.forEach(entry => {
+                        const time = new Date(entry.timestamp).toLocaleTimeString();
+                        chart.data.labels.push(time);
+                        chart.data.datasets[0].data.push(entry.pressure);
+                    });
+                    chart.update();
+                })
+                .catch(error => {
+                    console.error('Erro ao carregar os dados:', error);
+                });
+        }
+
+        // Função para verificar a pressão e ativar o alerta
+        function checkPressureAlert(pressure) {
+            const pressureContainer = document.getElementById('pressure-container');
+            if (pressure > 9 || pressure < 6) {
+                pressureContainer.classList.add('alert-blink');
+            } else {
+                pressureContainer.classList.remove('alert-blink');
+            }
+        }
+
+        // Função para atualizar a interface (pressão)
+        function updateInterface() {
+            fetch('/data')
+                .then(response => response.json())
+                .then(data => {
+                    // Atualiza o valor na interface
+                    document.getElementById('pressure').textContent = `${data.pressure} bar`;
+
+                    // Verifica se a pressão está fora dos limites
+                    checkPressureAlert(data.pressure);
+                })
+                .catch(error => {
+                    console.error('Erro ao atualizar a interface:', error);
+                });
+        }
+
+        // Função para atualizar o gráfico
+        function updateChart() {
+            fetch('/data')
+                .then(response => response.json())
+                .then(data => {
+                    // Adiciona novos dados ao gráfico
+                    const time = new Date().toLocaleTimeString();
+                    chart.data.labels.push(time);
+                    chart.data.datasets[0].data.push(data.pressure);
+
+                    // Mantém apenas os últimos 20 pontos no gráfico
+                    if (chart.data.labels.length > 20) {
+                        chart.data.labels.shift();
+                        chart.data.datasets[0].data.shift();
+                    }
+
+                    chart.update();
+                })
+                .catch(error => {
+                    console.error('Erro ao atualizar o gráfico:', error);
+                });
+        }
+
+        // Carrega os últimos 20 dados ao abrir a página
+        loadLatestData();
+
+        // Atualiza a interface a cada 5 segundos
+        setInterval(updateInterface, 5000);
+
+        // Atualiza o gráfico a cada 30 segundos
+        setInterval(updateChart, 180000);
+    </script>
+</body>
+</html>
