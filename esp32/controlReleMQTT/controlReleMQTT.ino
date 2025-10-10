@@ -6,7 +6,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// --- CONFIGURAÇÕES DO PROJETO (AJUSTADAS PARA WOKWI) ---
+// --- CONFIGURAÇÕES DO PROJETO (AJUSTADAS PARA WOKWI) --- 
 
 // Wi-Fi (Padrão do Wokwi)
 const char* ssid = "Wokwi-GUEST";
@@ -39,9 +39,7 @@ QueueHandle_t pressureQueue;
 void taskSensorReader(void *parameter);
 void taskMqttHandler(void *parameter);
 
-// ================================================================= //
-//                            SETUP                                  //
-// ================================================================= //
+
 void setup() {
   Serial.begin(115200);
   delay(1000); // Pequeno delay para estabilizar o serial monitor
@@ -109,7 +107,9 @@ void taskSensorReader(void *parameter) {
   }
 }
 
+// ================================================================= //
 //                 TAREFA DE COMUNICAÇÃO (BAIXA PRIORIDADE)          //
+// ================================================================= //
 void taskMqttHandler(void *parameter) {
   Serial.println("Tarefa MQTT (Prio Baixa) iniciada.");
   float receivedPressure;
@@ -151,4 +151,5 @@ void taskMqttHandler(void *parameter) {
 
 void loop() {
   // O loop principal fica vazio. O FreeRTOS agora gerencia a execução das tarefas.
+
 }
