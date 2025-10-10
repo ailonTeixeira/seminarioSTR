@@ -1,4 +1,4 @@
-//Incluisão das bibliotecas do FreeRTOS
+// REQUISITO DE TEMPO REAL: Inclusão das bibliotecas do FreeRTOS
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -6,7 +6,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// --- CONFIGURAÇÕES DO PROJETO (AJUSTADAS PARA WOKWI) --- 
+// --- CONFIGURAÇÕES DO PROJETO (AJUSTADAS PARA WOKWI) ---
 
 // Wi-Fi (Padrão do Wokwi)
 const char* ssid = "Wokwi-GUEST";
@@ -15,37 +15,45 @@ const char* password = "";
 // MQTT (Broker público para simulação)
 const char* mqtt_server = "broker.hivemq.com"; 
 const int mqtt_port = 1883;
+// MESMO tópico que o ESP32 sensor está publicando
 const char* mqtt_topic = "wokwi/pressao/pressureMQTT"; 
 
-// Sensor
-const int adcPin = 34; // Pino ADC para o sensor de pressão
+// Hardware de Atuação
+const int RELAY_PIN = 2; // Pino GPIO conectado ao relé. No Wokwi, é o LED azul.
+
+// --- LÓGICA DE CONTROLE --
+#define PRESSAO_LIGA    7.0
+#define PRESSAO_DESLIGA 9.0
 
 // --- CONFIGURAÇÕES DE TEMPO REAL ---
-#define SENSOR_READ_PERIOD_MS 1000 // Período da tarefa periódica de leitura (1 segundo)
-#define MQTT_TASK_DELAY_MS 20      // A tarefa de rede executa a cada 20ms
-
-// REQUISITO DE TEMPO REAL: Definir prioridades para as tarefas
-#define SENSOR_TASK_PRIORITY 2 // Prioridade mais alta para a tarefa crítica
-#define MQTT_TASK_PRIORITY   1 // Prioridade mais baixa para a tarefa não-crítica
+#define CONTROL_TASK_PRIORITY 2 // Prioridade mais alta para a tarefa de controle
+#define MQTT_TASK_PRIORITY    1 // Prioridade mais baixa para a tarefa de rede
 
 // --- OBJETOS GLOBAIS ---
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// REQUISITO DE TEMPO REAL: Criar um handle para a fila que comunicará as tarefas
-QueueHandle_t pressureQueue;
+// REQUISITO DE TEMPO REAL: Fila para passar dados da callback do MQTT para a tarefa de controle
+QueueHandle_t pressureDataQueue;
 
-// --- DECLARAÇÃO DAS TAREFAS (FreeRTOS) ---
-void taskSensorReader(void *parameter);
+// --- DECLARAÇÃO DAS TAREFAS E CALLBACKS ---
+void taskControlLogic(void *parameter);
 void taskMqttHandler(void *parameter);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 
-
+// ================================================================= //
+//                            SETUP                                  //
+// ================================================================= //
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Pequeno delay para estabilizar o serial monitor
+  delay(1000);
+
+  // Configura o pino do relé como saída
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // Garante que o compressor comece desligado
 
   // Conecta ao Wi-Fi
-  Serial.print("Conectando ao Wi-Fi...");
+  Serial.print("Atuador conectando ao Wi-Fi...");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -53,103 +61,93 @@ void setup() {
   }
   Serial.println("\nConectado ao Wi-Fi!");
 
-  // Configura o servidor MQTT
+  // Configura o MQTT e a função de callback que será chamada ao receber mensagens
   client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
 
-  // REQUISITO DE TEMPO REAL: Cria a fila para 5 itens do tipo float
-  pressureQueue = xQueueCreate(5, sizeof(float));
+  // Cria a fila para receber os dados de pressão
+  pressureDataQueue = xQueueCreate(5, sizeof(float));
 
-  if (pressureQueue == NULL) {
-    Serial.println("Erro ao criar a Fila!");
-  }
+  // Cria as tarefas do FreeRTOS
+  xTaskCreatePinnedToCore(taskControlLogic, "Control Task", 2048, NULL, CONTROL_TASK_PRIORITY, NULL, 1);
+  xTaskCreatePinnedToCore(taskMqttHandler, "MQTT Task", 4096, NULL, MQTT_TASK_PRIORITY, NULL, 0);
 
-  // REQUISITO DE TEMPO REAL: Cria as tarefas e as fixa nos núcleos do ESP32
-  // Tarefa de alta prioridade no núcleo 1
-  xTaskCreatePinnedToCore(
-      taskSensorReader,     // Função da tarefa
-      "Sensor Reader Task", // Nome para depuração
-      2048,                 // Tamanho da pilha (stack size)
-      NULL,                 // Parâmetros da tarefa
-      SENSOR_TASK_PRIORITY, // Prioridade
-      NULL,                 // Handle da tarefa
-      1);                   // Núcleo (Core) 1
-
-  // Tarefa de baixa prioridade no núcleo 0
-  xTaskCreatePinnedToCore(
-      taskMqttHandler,      // Função da tarefa
-      "MQTT Handler Task",  // Nome para depuração
-      4096,                 // Pilha maior por causa das operações de rede
-      NULL,                 // Parâmetros da tarefa
-      MQTT_TASK_PRIORITY,   // Prioridade
-      NULL,                 // Handle da tarefa
-      0);                   // Núcleo (Core) 0
-
-  Serial.println("Sistema de tempo real iniciado. Tarefas criadas.");
+  Serial.println("Sistema de tempo real do ATUADOR iniciado.");
 }
 
 // ================================================================= //
-//                    TAREFA DE LEITURA (ALTA PRIORIDADE)            //
+//          CALLBACK DO MQTT (Executa em um contexto de interrupção) //
 // ================================================================= //
-void taskSensorReader(void *parameter) {
-  Serial.println("Tarefa de Leitura (Prio Alta) iniciada.");
-  for (;;) { // Laço infinito da tarefa
-    // --- Aquisição de Dados ---
-    int adcValue = analogRead(adcPin);
-    float pressure = map(adcValue, 0, 4095, 0, 1000) / 100.0;
-    
-    // REQUISITO DE TEMPO REAL: Envia o dado para a fila de forma segura
-    // A tarefa de baixa prioridade será notificada para pegar este dado.
-    xQueueSend(pressureQueue, &pressure, portMAX_DELAY);
-    
-    // REQUISITO DE TEMPO REAL: Aguarda de forma NÃO-BLOQUEANTE pelo próximo ciclo.
-    // O processador fica livre para executar a tarefa MQTT durante esta espera.
-    vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_PERIOD_MS));
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // REQUISITO DE TEMPO REAL: A callback deve ser o mais rápida possível.
+  // Ela apenas converte o dado e o envia para a fila, sem fazer lógica complexa.
+  
+  // Converte o payload (bytes) para uma string e depois para float
+  payload[length] = '\0'; // Adiciona terminador nulo
+  float pressure = atof((char*)payload);
+  
+  // Envia o dado para a fila para ser processado pela tarefa de controle
+  xQueueSend(pressureDataQueue, &pressure, 0);
+}
+
+// ================================================================= //
+//               TAREFA DE CONTROLE (ALTA PRIORIDADE)                //
+// ================================================================= //
+void taskControlLogic(void *parameter) {
+  Serial.println("Tarefa de Controle (Prio Alta) iniciada. Aguardando dados de pressão...");
+  float receivedPressure;
+
+  for (;;) {
+    // REQUISITO DE TEMPO REAL: A tarefa "dorme" aqui (sem consumir CPU) até um
+    // novo dado chegar na fila. portMAX_DELAY significa esperar indefinidamente.
+    if (xQueueReceive(pressureDataQueue, &receivedPressure, portMAX_DELAY) == pdTRUE) {
+      Serial.print("[Control Task] Pressão recebida: ");
+      Serial.print(receivedPressure);
+      Serial.println(" bar");
+
+      // --- LÓGICA DE CONTROLE PRINCIPAL ---
+      if (receivedPressure <= PRESSAO_LIGA) {
+        if (digitalRead(RELAY_PIN) == LOW) {
+          Serial.println("  -> AÇÃO: Ligando o relé do compressor.");
+          digitalWrite(RELAY_PIN, HIGH); // Liga o compressor
+        }
+      } else if (receivedPressure >= PRESSAO_DESLIGA) {
+        if (digitalRead(RELAY_PIN) == HIGH) {
+          Serial.println("  -> AÇÃO: Desligando o relé do compressor.");
+          digitalWrite(RELAY_PIN, LOW); // Desliga o compressor
+        }
+      }
+    }
   }
 }
 
 // ================================================================= //
-//                 TAREFA DE COMUNICAÇÃO (BAIXA PRIORIDADE)          //
+//              TAREFA DE REDE/MQTT (BAIXA PRIORIDADE)               //
 // ================================================================= //
 void taskMqttHandler(void *parameter) {
   Serial.println("Tarefa MQTT (Prio Baixa) iniciada.");
-  float receivedPressure;
-
-  for (;;) { // Laço infinito da tarefa
-    // REQUISITO DE TEMPO REAL: A manutenção da conexão é feita de forma não-bloqueante
+  for (;;) {
     if (!client.connected()) {
-      Serial.print("MQTT desconectado. Tentando reconectar...");
-      if (client.connect("ESP32_RealTimeClient")) {
+      Serial.print("MQTT desconectado. Reconectando e assinando tópico...");
+      if (client.connect("ESP32_ActuatorClient")) {
         Serial.println("Conectado!");
+        // REQUISITO DE TEMPO REAL: Re-assina o tópico após reconectar
+        client.subscribe(mqtt_topic);
       } else {
-        Serial.print("Falha na reconexão, rc=");
-        Serial.print(client.state());
-        // Espera um pouco antes de tentar de novo, mas não bloqueia a outra tarefa
-        vTaskDelay(pdMS_TO_TICKS(2000)); 
-        continue; // Pula o resto do laço e tenta de novo
+        Serial.println("Falha na reconexão.");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        continue;
       }
     }
-    client.loop(); // Mantém a conexão MQTT viva, deve ser chamado frequentemente.
-
-    // REQUISITO DE TEMPO REAL: Verifica se há um novo dado na fila sem bloquear
-    // O timeout de 0 faz com que a função retorne imediatamente se a fila estiver vazia.
-    if (xQueueReceive(pressureQueue, &receivedPressure, 0) == pdTRUE) {
-      Serial.print("[MQTT Task] Novo dado recebido: ");
-      Serial.print(receivedPressure);
-      Serial.println(" bar. Publicando...");
-      
-      // Formata e publica a mensagem
-      char payload[10];
-      snprintf(payload, sizeof(payload), "%.2f", receivedPressure);
-      client.publish(mqtt_topic, payload);
-    }
-    
-    // REQUISITO DE TEMPO REAL: Pequeno delay para ceder o processador
-    // e garantir que outras tarefas de baixa prioridade (ou o idle) possam rodar.
-    vTaskDelay(pdMS_TO_TICKS(MQTT_TASK_DELAY_MS));
+    // Mantém a conexão MQTT viva e processa mensagens recebidas
+    client.loop();
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
+// ================================================================= //
+//                        LOOP PRINCIPAL (VAZIO)                     //
+// ================================================================= //
 void loop() {
-  // O loop principal fica vazio. O FreeRTOS agora gerencia a execução das tarefas.
-
+  // O loop principal fica vazio. O FreeRTOS agora gerencia a execução.
 }
